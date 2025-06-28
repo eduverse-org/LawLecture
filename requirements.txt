@@ -1,0 +1,11 @@
+Flask
+sentence-transformers
+psycopg2-binary
+numpy
+groq
+python-dotenv
+transformers
+torch
+requests
+flask_cors
+gunicorn
