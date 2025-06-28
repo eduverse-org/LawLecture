@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import os
 import logging
 import re
-from sentence_transformers import SentenceTransformer
+from google import genai
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import numpy as np
@@ -10,7 +10,6 @@ from groq import Groq
 from dotenv import load_dotenv
 from flask_cors import CORS
 
-# Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
@@ -69,24 +68,20 @@ Instructions:
 
 class LegalLearningPipeline:
     """Handles query processing, document retrieval, and response generation."""
-    
-    LEGAL_KEYWORDS = [
-        "law", r"legal", r"penal", "contract", "justice", "dowry", "constitution", "evidence",
-        "act", "section", "court", "judge", "lawyer", "legal", "case", "right", "silence",
-        "prohibition", "amendment", "criminal", "civil", "statute", "jurisprudence"
-    ]
-    NON_LEGAL_KEYWORDS = [
-        r"code\b", "coding", "programming", "python", "javascript", "html", "css",
-        "algorithm", "software", "database", "debug", "program", "script", "computer"
-    ]
+
     COMPLEX_QUERY_KEYWORDS = ["curriculum", "teach", "step", "lesson", "explain in detail"]
 
     def __init__(self):
-        """Initialize with embedding model, database connection, and Groq client."""
+        """Initialize with Google Gemini embedding model, database connection, and Groq client."""
         self.logger = self._setup_logging()
         
-        # Initialize embedding model (gte-small)
-        self.model = SentenceTransformer('thenlper/gte-small')
+        # Initialize Google GenAI client for embeddings
+        try:
+            self.genai_client = genai.Client()
+            self.embedding_model = "gemini-embedding-exp-03-07"
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Google GenAI client: {str(e)}")
+            raise ValueError("Failed to initialize Google GenAI client. Ensure proper authentication is set up.")
         
         self.db_url = os.getenv('DATABASE_URL')
         if not self.db_url:
@@ -122,24 +117,23 @@ class LegalLearningPipeline:
             self.logger.error(f"Database connection failed: {str(e)}")
             return None
 
-    def is_legal_query(self, query):
-        """Classify query as legal or non-legal based on keywords."""
-        query_lower = query.lower()
-        
-        # Check for non-legal keywords first
-        for keyword in self.NON_LEGAL_KEYWORDS:
-            if re.search(keyword, query_lower):
-                self.logger.info(f"Non-legal query detected: {query} (matched {keyword})")
-                return False
-        
-        # Check for legal keywords
-        for keyword in self.LEGAL_KEYWORDS:
-            if re.search(keyword, query_lower):
-                self.logger.info(f"Legal query detected: {query} (matched {keyword})")
-                return True
-        
-        self.logger.info(f"Non-legal query detected: {query} (no legal keywords)")
-        return False
+    def get_embedding(self, text):
+        """Generate embedding using Google Gemini API."""
+        try:
+            result = self.genai_client.models.embed_content(
+                model=self.embedding_model,
+                contents=text
+            )
+            # Extract the first embedding from the result
+            embedding = result.embeddings[0] if result.embeddings else None
+            if embedding is None:
+                raise ValueError("No embedding returned from Gemini API")
+            
+            # Convert to numpy array
+            return np.array(embedding)
+        except Exception as e:
+            self.logger.error(f"Failed to generate embedding: {str(e)}")
+            raise
 
     def estimate_query_complexity(self, query):
         """Estimate query complexity to set max_tokens."""
@@ -158,8 +152,8 @@ class LegalLearningPipeline:
         try:
             self.logger.info(f"Processing query: {query}")
             
-            # Generate query embedding
-            query_embedding = self.model.encode([query])[0]
+            # Generate query embedding using Google Gemini
+            query_embedding = self.get_embedding(query)
             
             # Connect to database
             conn = self.get_db_connection()
@@ -180,10 +174,10 @@ class LegalLearningPipeline:
             similarities = []
             for row in rows:
                 # Convert stored embedding back to numpy array
-                stored_embedding = np.array(row['embeddings'])
+                stored_embedding = np.array(row['embedding'])
                 similarity = self.cosine_similarity(query_embedding, stored_embedding)
                 similarities.append({
-                    'text': row['text'],
+                    'text': row['content'],
                     'similarity': similarity
                 })
             
@@ -231,18 +225,8 @@ class LegalLearningPipeline:
             return "Error generating response. Please try again."
 
     def process_query(self, query, n_results=10):
-        """Main pipeline: classify query, retrieve documents, generate response."""
+        """Main pipeline: retrieve documents, generate response."""
         self.logger.info(f"Starting pipeline for query: {query}")
-        
-        # Check if query is legal-related
-        if not self.is_legal_query(query):
-            response = "Sorry, I can only assist with legal and law-based questions."
-            self.logger.info(f"Rejected non-legal query: {query}")
-            return {
-                "query": query,
-                "response": response,
-                "status": "rejected"
-            }
         
         # Retrieve relevant documents
         retrieved_docs = self.retrieve_documents(query, n_results)
@@ -292,6 +276,11 @@ def learn_topic():
             "error": "Internal server error",
             "message": str(e)
         }), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({"status": "healthy", "service": "Legal Learning API"})
 
 if __name__ == '__main__':
     app.run(debug=True)
